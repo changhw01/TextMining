@@ -1,51 +1,113 @@
+import time
+import pickle
+import heapq
+import math
+import multiprocessing
+
 import numpy as np
 from scipy.linalg import norm
 from scipy.sparse import dok_matrix
 from sklearn.metrics.pairwise import linear_kernel
-import threading
-import time
-import pickle
 
-class LKComputer(threading.Thread):
-
-    def __init__(self,dataM,doc_id_list,tgt_range,fn_out,topN=200,batch_size=1000):
-
-        ''' tgt_range is in the format of usual python indexing. 
-            That is, starts from 0 and not inclusive the end.
-        '''
-        threading.Thread.__init__(self)
-        self.dataM = dataM
-        self.doc_id_list = doc_id_list
-        self.tgt_range = tgt_range
-        self.fn_out = fn_out
-        self.topN = topN
-        self.batch_size = batch_size
+def thread_cos_diag(top_nbrs,dataM,job_ranges,c_offset,
+                    n_nbr=100,verbose=False):
     
-    def run(self):
-        fout = open(self.fn_out,'w')
+    ''' (cos,idx) 
+        Note in the min-heap, the first one is the smallest.
+    '''
 
-        n_doc_work = self.tgt_range[1]-self.tgt_range[0]
-        n_batch = int(np.ceil(float(n_doc_work)/self.batch_size))
-
-        for i in range(n_batch):
-            work_range = [self.tgt_range[0]+i*self.batch_size, self.tgt_range[0]+(i+1)*self.batch_size]
-            print(work_range)
-
-            if work_range[1]>self.tgt_range[1]:
-                work_range[1] = self.tgt_range[1]
+    for job_bd in job_ranges:
+        crossV = linear_kernel(dataM[job_bd[0]:job_bd[1],:],dataM)
+        n_doc1, n_doc2 = crossV.shape
         
-            crossD = 1-linear_kernel(self.dataM[work_range[0]:work_range[1]],self.dataM)
-            for j in range(crossD.shape[0]):
-                I_sorting = np.argsort(crossD[j,:])
-                outdata = []
-                for k in range(1,self.topN+1):
-                    idx = I_sorting[k]
-                    outdata.append('%s,%f'%(self.doc_id_list[idx],crossD[j,idx]))
-                fout.write(self.doc_id_list[work_range[0]+j]+'\t'+','.join(outdata)+'\n')
+        for i_doc in range(n_doc1):
+            i_offset = i_doc + job_bd[0]
+            L = top_nbrs[i_offset]
+            for j in range(n_doc2):            
+                if i_offset == j+c_offset:
+                    continue
 
-        fout.close()
+                if len(L)<n_nbr:
+                    heapq.heappush(L, (crossV[i_doc,j],j+c_offset))
+                elif crossV[i_doc,j] > L[0][0]:
+                    heapq.heapreplace(L, (crossV[i_doc,j],j+c_offset))
+        
+            top_nbrs[i_offset] = L
+
+        if verbose:
+            print('process range (%d,%d)'%(job_bd[0],job_bd[1]))
+
+def thread_diag_block(top_nbrs,dataM,job_ranges,r_offset, c_offset,
+                    n_nbr=100,verbose=False):
+    
+    ''' (cos,idx) 
+        Note in the min-heap, the first one is the smallest.
+    '''
+
+    for job_bd in job_ranges:
+        crossV = linear_kernel(dataM[job_bd[0]:job_bd[1],:],dataM)
+        n_doc1, n_doc2 = crossV.shape
+        
+        for i_doc in range(n_doc1):
+            i_offset = i_doc + job_bd[0] + r_offset
+            L = top_nbrs[i_offset]
+            for j in range(n_doc2):            
+                if i_offset == j+c_offset:
+                    continue
+
+                if len(L)<n_nbr:
+                    heapq.heappush(L, (crossV[i_doc,j],j+c_offset))
+                elif crossV[i_doc,j] > L[0][0]:
+                    heapq.heapreplace(L, (crossV[i_doc,j],j+c_offset))
+        
+            top_nbrs[i_offset] = L
+
+        if verbose:
+            print('process range (%d,%d)'%(job_bd[0],job_bd[1]))
+
+def diag_block_launcher(top_nbrs, dataM,r_offset, c_offset,n_nbr=100,batch_size=500,n_thread=4):
 
 
+    n_doc = dataM.shape[0]
+  
+    # prepare the nbr data structure
+    '''
+    manager = multiprocessing.Manager()
+    top_nbrs = manager.list()
+    for i in range(n_doc):
+        top_nbrs.append([])
+    '''
+
+    # prepare the job ranges
+    job_queue = [[i*batch_size,(i+1)*batch_size] \
+                 for i in range(int(math.ceil(float(n_doc)/batch_size)))]
+
+    if job_queue[len(job_queue)-1][1]>n_doc:
+        job_queue[len(job_queue)-1][1] = n_doc    
+
+    n_job = len(job_queue)
+    n_job_per_thread = int(math.ceil(float(n_job)/n_thread))
+    job_collections = []
+    for i in range(n_thread):
+        if (i+1)*n_job_per_thread < n_job:
+            job_collections.append(job_queue[i*n_job_per_thread:(i+1)*n_job_per_thread])
+        else:
+            job_collections.append(job_queue[i*n_job_per_thread:n_job])
+    
+    # start the work
+    time_s = time.time()
+    workers = []
+    for i in range(n_thread):
+        workers.append(multiprocessing.Process(target=thread_diag_block,
+            args=(top_nbrs, dataM, job_collections[i],r_offset,c_offset,100,True)))
+        print('Prepare to start worker %d'%i)
+
+    for worker in workers:
+        worker.start()        
+
+    for worker in workers:
+        worker.join()
+    print('time spent: %f sec'%(time.time()-time_s))
 
 def compute_tfidf(fn_in,fn_out,n_doc,vocabulary,normalize=True):
 
@@ -185,8 +247,12 @@ def load_tfidf(fn_in,line_start=1,line_end=None,
 
 #-------- Utility Functions ------------#
 
-def txt2pickle(fn,n_line,vocabulary):
-    dataM = load_tfidf(fn,n_line=n_line,vocabulary=6423670,verbose=False)
+def txt2pickle(fn,n_line,vocabulary=None):
+
+    if vocabulary is None:
+        vocabulary = 6423670
+
+    dataM = load_tfidf(fn,n_line=n_line,vocabulary=vocabulary,verbose=False)
     fout = open(fn+'.pickle','w')
     pickle.dump(dataM,fout)
     fout.close()
